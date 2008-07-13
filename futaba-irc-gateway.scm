@@ -14,8 +14,7 @@
 (use gauche.reload)
 (use www.futaba)
 
-(define *watching-boards*  '()) ; ((board-url . last-updated) ...)
-(define *watching-threads* '()) ; ((thread-url . last-updated) ...)
+(define *watching-urls* '()) ; ((url . last-updated) ...)
 
 (define-syntax fork-do
   (syntax-rules ()
@@ -24,72 +23,74 @@
        (make-thread
          (lambda () body ...))))))
 
+(define (date<? date0 date1)
+  (time<? (date->time-utc date0) (date->time-utc date1)))
+
+(define (for-each-line proc string)
+  (for-each proc (string-split string #[\r\n])))
+
 (define (log-message message)
   (print message)
   (irc-send-message-to '* #f 'NOTICE message))
 
 (define (start-watching url)
-  (if (#/\.htm$/ url)
-    (start-watching-thread url)
-    (start-watching-board url)))
+  (log-message #`"start watching ,url")
+  (push! *watching-urls* (cons url (time-utc->date (make-time 'time-utc 0 0))))
+  (show-backlog url))
 
 (define (stop-watching url)
-  (if (#/\.htm$/ url)
-    (stop-watching-thread url)
-    (stop-watching-board url)))
+  (log-message #`"stop watching ,url")
+  (update! *watching-urls* (pa$ remove! (lambda (p) (string=? (car p) url)))))
 
-(define (start-watching-board url)
-  (push! *watching-boards* (cons url #f))
-  (refresh-boards))
-
-(define (stop-watching-board url)
-  (delete! (lambda (p) (equal? (car p) url)) *watching-boards*))
-
-(define (start-watching-thread url)
-  (push! *watching-threads* (cons url #f))
-  (guard (e (else (print e)))
-    (show-thread-backlog url)))
-
-(define (stop-watching-thread url)
-  (delete! (lambda (p) (equal? (car p) url)) *watching-threads*))
-
-(define (refresh-boards)
+(define (refresh)
   (fork-do
-    (dolist (pair *watching-boards*)
-      (let*-values (((url last-updated) (car+cdr pair))
-                    ((threads) (or (futaba-parse-index (url->string url)) '())))
-        (dolist (thread threads)
-          (when (or (not last-updated)
-                    (date<? last-updated (assoc-ref thread 'date)))
-            (for-each
+    (dolist (url+last-updated *watching-urls*)
+      (let*-values (((url last-updated) (car+cdr url+last-updated))
+                    ((items url-type status) (futaba-url->list url)))
+        (log-message #`",status ,url")
+        (dolist (item (or items '()))
+          (when (or (not (eq? url-type 'thread)) (date<? last-updated (assoc-ref item 'date)))
+            (for-each-line
               (lambda (line)
-                (irc-privmsg-to
-                  (url->channel url)
-                  (url->channel url)
-                  #`",(url+path->channel url (assoc-ref thread 'path)) ,line"))
-              (string-split (assoc-ref thread 'body) #/[\r\n]/)))))
-      (set-cdr! pair (current-date)))))
+                (case url-type
+                  ((index) 
+                   (irc-privmsg-to
+                     (url->channel url)
+                     (url->channel url)
+                     #`",(url+path->channel url (assoc-ref item 'path)) ,line"))
+                  ((thread)
+                   (irc-privmsg-to
+                     (url->channel url)
+                     (no->ident (assoc-ref item 'no))
+                     line))))
+              (assoc-ref item 'body))
+            (irc-notice-to (url->channel url) "-" " "))))
+      (set-cdr! url+last-updated (current-date)))))
 
-(define (refresh-threads)
+(define (show-backlog url)
   (fork-do
-    (dolist (pair *watching-threads*)
-      (let*-values (((url last-updated) (car+cdr pair))
-                    ((responses) (or (futaba-parse-thread (url->string url)) '())))
-        (dolist (response responses)
-          (when (or (not last-updated)
-                    (date<? last-updated (assoc-ref response 'date)))
-            (for-each
-              (lambda (line)
-                (irc-privmsg-to
-                  (url->channel url)
-                  (no->ident (assoc-ref response 'no))
-                  ;(irc-prefix-of (current-irc-server))
-                  line))
-              (string-split (assoc-ref response 'body) #/[\r\n]/)))))
-      (set-cdr! pair (current-date)))))
+    (receive (items url-type status) (futaba-url->list url)
+      (log-message #`",status ,url")
+      (dolist (item (or items '()))
+        (for-each-line
+          (lambda (line)
+            (case url-type
+              ((index) 
+               (irc-notice-to
+                 (url->channel url)
+                 (url->channel url)
+                 #`"(,(date->string (assoc-ref item 'date) \"~X\")) ,(url+path->channel url (assoc-ref item 'path)) ,line"))
+              ((thread)
+               (irc-notice-to
+                 (url->channel url)
+                 (no->ident (assoc-ref item 'no))
+                 #`"(,(date->string (assoc-ref item 'date) \"~X\")) ,line"))))
+          (assoc-ref item 'body))
+        (irc-notice-to (url->channel url) "-" " ")))
+    (set-cdr! (assoc url *watching-urls*) (current-date))))
 
 (define (show-thread-backlog url)
-  (let1 responses (or (futaba-parse-thread (url->string url)) '())
+  (let1 responses (or (futaba-url->list url) '())
     (dolist (response responses)
       (for-each
         (lambda (line)
@@ -104,9 +105,6 @@
 
 (define (no->ident no)
   (number->string (x->integer (string-reverse no)) 36))
-
-(define (date<? date0 date1)
-  (time<? (date->time-utc date0) (date->time-utc date1)))
 
 (define (url->channel url)
   (rxmatch-cond
@@ -131,12 +129,6 @@
        (#f server no)
      #`"http://,|server|.2chan.net/b/res/,|no|.htm")))
 
-(define (url->string url)
-  (receive (#f #f host #f path #f #f) (uri-parse url)
-    (receive (status #f html) (http-get host path)
-      (log-message #`",status ,url")
-      (ces-convert html "*JP"))))
-
 (define (main args)
   (make <pseudo-irc-server> :name "futaba")
 
@@ -154,9 +146,16 @@
         (stop-watching (channel->url channel)))
       (string-split channel ",")))
 
+  (irc-on-command PRIVMSG (client channel msg)
+    (cond
+      ((string=? msg "url")
+       (irc-notice-to
+         channel
+         (irc-prefix-of (current-irc-server)) ; TODO #f または (current-irc-server) とできるとよい
+         (channel->url channel)))))
+
   (irc-on-command REFRESH ()
-    (refresh-boards)
-    (refresh-threads))
+    (refresh))
 
   (irc-on-command EVAL (client . params)
     (let1 result (guard (e (else e))
@@ -170,3 +169,5 @@
       (thread-sleep! 60)))
 
   (irc-server-start))
+
+(main '())
