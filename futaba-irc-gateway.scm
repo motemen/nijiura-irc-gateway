@@ -1,6 +1,4 @@
 #!gosh
-(define-module www.futaba.irc-gateway)
-(select-module www.futaba.irc-gateway)
 (use srfi-1)
 (use srfi-11)
 (use srfi-13)
@@ -164,9 +162,8 @@
 
   (fork-do
     (while #t
-      (refresh-boards)
-      (refresh-threads)
-      (thread-sleep! 60)))
+      (refresh)
+      (thread-sleep! 120)))
 
   (irc-server-start))
 
