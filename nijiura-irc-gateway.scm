@@ -10,7 +10,7 @@
 (use gauche.charconv)
 (use gauche.threads)
 (use gauche.reload)
-(use www.futaba)
+(use www.futaba.nijiura)
 
 (define *watching-urls* '()) ; ((url . last-updated) ...)
 
@@ -44,10 +44,11 @@
   (fork-do
     (dolist (url+last-updated *watching-urls*)
       (let*-values (((url last-updated) (car+cdr url+last-updated))
-                    ((items url-type status) (futaba-url->list url)))
+                    ((items url-type status) (nijiura-url->list url)))
         (log-message #`",status ,url")
         (dolist (item (or items '()))
           (when (or (not (eq? url-type 'thread)) (date<? last-updated (assoc-ref item 'date)))
+            (irc-notice-to (url->channel url) "-" " ")
             (for-each-line
               (lambda (line)
                 (case url-type
@@ -59,17 +60,18 @@
                   ((thread)
                    (irc-privmsg-to
                      (url->channel url)
-                     (no->ident (assoc-ref item 'no))
+                     #`"No.,(assoc-ref item 'no)"
                      line))))
-              (assoc-ref item 'body))
-            (irc-notice-to (url->channel url) "-" " "))))
+              (assoc-ref item 'body)))
+          ))
       (set-cdr! url+last-updated (current-date)))))
 
 (define (show-backlog url)
   (fork-do
-    (receive (items url-type status) (futaba-url->list url)
+    (receive (items url-type status) (nijiura-url->list url)
       (log-message #`",status ,url")
       (dolist (item (or items '()))
+        (irc-notice-to (url->channel url) "-" " ")
         (for-each-line
           (lambda (line)
             (case url-type
@@ -81,14 +83,13 @@
               ((thread)
                (irc-notice-to
                  (url->channel url)
-                 (no->ident (assoc-ref item 'no))
+                 #`"No.,(assoc-ref item 'no)"
                  #`"(,(date->string (assoc-ref item 'date) \"~X\")) ,line"))))
-          (assoc-ref item 'body))
-        (irc-notice-to (url->channel url) "-" " ")))
+          (assoc-ref item 'body))))
     (set-cdr! (assoc url *watching-urls*) (current-date))))
 
 (define (show-thread-backlog url)
-  (let1 responses (or (futaba-url->list url) '())
+  (let1 responses (or (nijiura-url->list url) '())
     (dolist (response responses)
       (for-each
         (lambda (line)
@@ -128,7 +129,7 @@
      #`"http://,|server|.2chan.net/b/res/,|no|.htm")))
 
 (define (main args)
-  (make <pseudo-irc-server> :name "futaba")
+  (make <pseudo-irc-server> :name "nijiura")
 
   (irc-server-register-default-callbacks)
 
@@ -166,5 +167,3 @@
       (thread-sleep! 120)))
 
   (irc-server-start))
-
-(main '())
