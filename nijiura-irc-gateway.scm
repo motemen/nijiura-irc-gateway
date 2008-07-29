@@ -23,6 +23,7 @@
        (make-thread
          (lambda () body ...))))))
 
+;; TODO: error handling
 (define-syntax define-asynchronous-proc
   (syntax-rules ()
     ((_ (formals ...) body ...)
@@ -40,6 +41,13 @@
 (define (log-message message)
   (print message)
   (irc-send-message-to '* #f 'NOTICE message))
+
+(define (apply* proc . args)
+  (let ((ar (arity proc))
+        (args (apply cons* args)))
+    (if (arity-at-least? ar)
+      (apply proc args)
+      (apply proc (take (append args (circular-list #f)) ar)))))
 
 ;;;; Main code
 ;;; Fetching
@@ -119,16 +127,28 @@
   (set-cdr! (assoc url *watching-urls*) (current-date)))
 
 ;;; PRIVMSG commands
+(define *commands* (make-hash-table))
+
 (define (command-grep channel word)
-  (for-each
-    (lambda (item)
-      (when (string-contains (assoc-ref item 'body) word)
-        (send-item
-          irc-privmsg-to
-          channel
-          "grep"
-          item)))
-    (hash-table-get *cache* (channel->url channel) '())))
+  (and-let* ((url (channel->url channel))
+             (url-type (nijiura-url-type url))
+             ( (list? url-type) )
+             (url-type (car url-type)))
+    (for-each
+      (lambda (item)
+        (when (string-contains (assoc-ref item 'body) word)
+          (send-item
+            irc-privmsg-to
+            channel
+            "grep"
+            item
+            :prefix (if (eq? url-type 'index)
+                      (url+path->channel url (assoc-ref item 'path))
+                      #`"No.,(assoc-ref item 'no)")
+            )))
+      (hash-table-get *cache* (channel->url channel) '()))))
+
+(hash-table-put! *commands* 'grep command-grep)
 
 ;;; URL <-> Channel
 (define (url->channel url)
@@ -187,6 +207,13 @@
     (let1 result (guard (e (else e))
                    (eval (call-with-input-string (string-join params) read) (current-module)))
       (irc-notice-to client #f (x->string result))))
+
+  (irc-on-command PRIVMSG (client channel msg)
+    (and-let* ((m (#/^:(\w+) (.+)/ msg))
+               (command (m 1))
+               (param   (m 2))
+               (command-handler (hash-table-get *commands* (string->symbol (string-downcase command)) #f)))
+      (command-handler channel param)))
 
   (fork-do
     (while #t
