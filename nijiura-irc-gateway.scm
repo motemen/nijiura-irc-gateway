@@ -12,14 +12,24 @@
 (use gauche.reload)
 (use www.futaba.nijiura)
 
-(define *watching-urls* '()) ; ((url . last-updated) ...)
+(define *watching-urls* '())                 ; ((url . last-updated) ...)
+(define *cache* (make-hash-table 'string=?)) ; url => responses or threads
 
+;;;; Utility
 (define-syntax fork-do
   (syntax-rules ()
     ((_ body ...)
      (thread-start!
        (make-thread
          (lambda () body ...))))))
+
+(define-syntax define-asynchronous-proc
+  (syntax-rules ()
+    ((_ (formals ...) body ...)
+     (define (formals ...)
+       (thread-start!
+         (make-thread
+           (lambda () body ...)))))))
 
 (define (date<? date0 date1)
   (time<? (date->time-utc date0) (date->time-utc date1)))
@@ -31,6 +41,22 @@
   (print message)
   (irc-send-message-to '* #f 'NOTICE message))
 
+;;;; Main code
+;;; Fetching
+(define (nijiura-get/cache url)
+  (receive (items url-type status) (nijiura-get url)
+    (log-message #`",status ,url")
+    (hash-table-update!
+      *cache*
+      url
+      (pa$ lset-union
+           (lambda (x y)
+             (equal? (assoc-ref x 'no) (assoc-ref y 'no)))
+           items)
+      '())
+    (values items url-type status)))
+
+;;; Watching
 (define (start-watching url)
   (log-message #`"start watching ,url")
   (push! *watching-urls* (cons url (time-utc->date (make-time 'time-utc 0 0))))
@@ -40,71 +66,71 @@
   (log-message #`"stop watching ,url")
   (update! *watching-urls* (pa$ remove! (lambda (p) (string=? (car p) url)))))
 
-(define (refresh)
-  (fork-do
-    (dolist (url+last-updated *watching-urls*)
-      (let*-values (((url last-updated) (car+cdr url+last-updated))
-                    ((items url-type status) (nijiura-url->list url)))
-        (log-message #`",status ,url")
-        (dolist (item (or items '()))
-          (when (or (not (eq? url-type 'thread)) (date<? last-updated (assoc-ref item 'date)))
-            (irc-notice-to (url->channel url) "-" " ")
-            (for-each-line
-              (lambda (line)
-                (case url-type
-                  ((index) 
-                   (irc-privmsg-to
-                     (url->channel url)
-                     (url->channel url)
-                     #`",(url+path->channel url (assoc-ref item 'path)) ,line"))
-                  ((thread)
-                   (irc-privmsg-to
-                     (url->channel url)
-                     #`"No.,(assoc-ref item 'no)"
-                     line))))
-              (assoc-ref item 'body)))
-          ))
-      (set-cdr! url+last-updated (current-date)))))
+;;; Show log
+(define (send-item type channel nick item . options)
+  (let-keywords options ((prefix #f))
+    (for-each-line
+      (lambda (line)
+        ((if (eq? type 'privmsg) irc-privmsg-to irc-notice-to)
+         channel
+         nick
+         (if prefix #`",prefix ,line" line)))
+      (assoc-ref item 'body))))
 
-(define (show-backlog url)
-  (fork-do
-    (receive (items url-type status) (nijiura-url->list url)
-      (log-message #`",status ,url")
+(define-asynchronous-proc (refresh)
+  (dolist (url+last-updated *watching-urls*)
+    (let*-values (((url last-updated) (car+cdr url+last-updated))
+                  ((items url-type status) (nijiura-get/cache url)))
       (dolist (item (or items '()))
-        (irc-notice-to (url->channel url) "-" " ")
-        (for-each-line
-          (lambda (line)
+        (when (or (not (eq? url-type 'thread)) (date<? last-updated (assoc-ref item 'date)))
+          (irc-notice-to (url->channel url) "-" " ")
+          (apply
+            send-item
+            'privmsg
             (case url-type
-              ((index) 
-               (irc-notice-to
-                 (url->channel url)
-                 (url->channel url)
-                 #`"(,(date->string (assoc-ref item 'date) \"~X\")) ,(url+path->channel url (assoc-ref item 'path)) ,line"))
+              ((index)
+               (list (url->channel url)
+                     (url+path->channel url (assoc-ref item 'path))
+                     item))
               ((thread)
-               (irc-notice-to
-                 (url->channel url)
-                 #`"No.,(assoc-ref item 'no)"
-                 #`"(,(date->string (assoc-ref item 'date) \"~X\")) ,line"))))
-          (assoc-ref item 'body))))
-    (set-cdr! (assoc url *watching-urls*) (current-date))))
+               (list (url->channel url)
+                     (string-join `(,#`"No.,(assoc-ref item 'no)" ,@(cond ((assoc-ref item 'mail) => (lambda (m) (list #`"[,m]"))) (else '()))))
+                     item)))))))
+    (set-cdr! url+last-updated (current-date))))
 
-(define (show-thread-backlog url)
-  (let1 responses (or (nijiura-url->list url) '())
-    (dolist (response responses)
-      (for-each
-        (lambda (line)
-          (irc-notice-to
-            (url->channel url)
-            (no->ident (assoc-ref response 'no))
-            ;(irc-prefix-of (current-irc-server))
-            #`"(,(date->string (assoc-ref response 'date) \"~X\")) ,line"))
-        (string-split (assoc-ref response 'body) #/[\r\n]/))
-      ))
-  (set-cdr! (assoc url *watching-threads*) (current-date)))
+(define-asynchronous-proc (show-backlog url)
+  (receive (items url-type status) (nijiura-get/cache url)
+    (dolist (item (or items '()))
+      (irc-notice-to (url->channel url) "-" " ")
+      (apply
+        send-item
+        'notice
+        (case url-type
+          ((index)
+           (list (url->channel url)
+                 (url+path->channel url (assoc-ref item 'path))
+                 item
+                 :prefix (date->string (assoc-ref item 'date) "~X")))
+          ((thread)
+           (list (url->channel url)
+                 (string-join `(,#`"No.,(assoc-ref item 'no)" ,@(cond ((assoc-ref item 'mail) => (lambda (m) (list #`"[,m]"))) (else '()))))
+                 item
+                 :prefix (date->string (assoc-ref item 'date) "~X")))))))
+  (set-cdr! (assoc url *watching-urls*) (current-date)))
 
-(define (no->ident no)
-  (number->string (x->integer (string-reverse no)) 36))
+;;; PRIVMSG commands
+(define (command-grep channel word)
+  (for-each
+    (lambda (item)
+      (when (string-contains (assoc-ref item 'body) word)
+        (send-item
+          irc-privmsg-to
+          channel
+          "grep"
+          item)))
+    (hash-table-get *cache* (channel->url channel) '())))
 
+;;; URL <-> Channel
 (define (url->channel url)
   (rxmatch-cond
     ((#/^http:\/\/(\w+)\.2chan.net\/b\/$/ url)
@@ -128,6 +154,7 @@
        (#f server no)
      #`"http://,|server|.2chan.net/b/res/,|no|.htm")))
 
+;;; Main
 (define (main args)
   (make <pseudo-irc-server> :name "nijiura")
 
@@ -150,7 +177,7 @@
       ((string=? msg "url")
        (irc-notice-to
          channel
-         (irc-prefix-of (current-irc-server)) ; TODO #f または (current-irc-server) とできるとよい
+         #f
          (channel->url channel)))))
 
   (irc-on-command REFRESH ()
@@ -159,7 +186,7 @@
   (irc-on-command EVAL (client . params)
     (let1 result (guard (e (else e))
                    (eval (call-with-input-string (string-join params) read) (current-module)))
-      (irc-send-notice-to-client (current-irc-server) client result)))
+      (irc-notice-to client #f (x->string result))))
 
   (fork-do
     (while #t
