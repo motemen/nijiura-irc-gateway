@@ -38,8 +38,7 @@
 (define (for-each-line proc string)
   (for-each proc (string-split string #[\r\n])))
 
-(define (log-message message)
-  (print message)
+(define (log-info message)
   (irc-send-message-to '* #f 'NOTICE message))
 
 (define (apply* proc . args)
@@ -53,7 +52,7 @@
 ;;; Fetching
 (define (nijiura-get/cache url)
   (receive (items url-type status) (nijiura-get url)
-    (log-message #`",status ,url")
+    (log-info #`",status ,url")
     (hash-table-update!
       *cache*
       url
@@ -66,12 +65,12 @@
 
 ;;; Watching
 (define (start-watching url)
-  (log-message #`"start watching ,url")
+  (log-info #`"start watching ,url")
   (push! *watching-urls* (cons url (time-utc->date (make-time 'time-utc 0 0))))
   (show-backlog url))
 
 (define (stop-watching url)
-  (log-message #`"stop watching ,url")
+  (log-info #`"stop watching ,url")
   (update! *watching-urls* (pa$ remove! (lambda (p) (string=? (car p) url)))))
 
 ;;; Show log
