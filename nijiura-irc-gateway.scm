@@ -108,7 +108,6 @@
     (let*-values (((url last-updated) (car+cdr url+last-updated))
                   ((items url-type status) (nijiura-get-updated url)))
       (dolist (item (or items '()))
-          (log-info item)
         (when (or (not (eq? url-type 'thread)) (date<? last-updated (assoc-ref item 'date)))
           (irc-notice-to (url->channel url) "-" " ")
           (apply
