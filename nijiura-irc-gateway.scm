@@ -21,7 +21,9 @@
     ((_ body ...)
      (thread-start!
        (make-thread
-         (lambda () body ...))))))
+         (lambda ()
+           (guard (e (else (log-error (ref e 'message))))
+             body ...)))))))
 
 ;; TODO: error handling
 (define-syntax define-asynchronous-proc
@@ -30,7 +32,9 @@
      (define (formals ...)
        (thread-start!
          (make-thread
-           (lambda () body ...)))))))
+           (lambda ()
+             (guard (e (else (log-error (ref e 'message))))
+               body ...))))))))
 
 (define (date<? date0 date1)
   (time<? (date->time-utc date0) (date->time-utc date1)))
@@ -41,12 +45,19 @@
 (define (log-info message)
   (irc-send-message-to '* #f 'NOTICE message))
 
+(define (log-error message)
+  (display #`"[error] ,message\n" (current-error-port))
+  (irc-send-message-to '* #f 'NOTICE #`"[error] ,message"))
+
 (define (apply* proc . args)
   (let ((ar (arity proc))
         (args (apply cons* args)))
     (if (arity-at-least? ar)
       (apply proc args)
       (apply proc (take (append args (circular-list #f)) ar)))))
+
+(define (number-equal? x y)
+  (equal? (assoc-ref x 'no) (assoc-ref y 'no)))
 
 ;;;; Main code
 ;;; Fetching
@@ -56,12 +67,20 @@
     (hash-table-update!
       *cache*
       url
-      (pa$ lset-union
-           (lambda (x y)
-             (equal? (assoc-ref x 'no) (assoc-ref y 'no)))
-           items)
+      (pa$ lset-union number-equal? items)
       '())
     (values items url-type status)))
+
+(define (nijiura-get-updated url)
+  (receive (items url-type status) (nijiura-get url)
+    (log-info #`",status ,url")
+    (let1 updated-items (lset-difference number-equal? items (hash-table-get *cache* url '()))
+      (hash-table-update!
+        *cache*
+        url
+        (pa$ lset-union number-equal? items)
+        '())
+      (values updated-items url-type status))))
 
 ;;; Watching
 (define (start-watching url)
@@ -87,8 +106,9 @@
 (define-asynchronous-proc (refresh)
   (dolist (url+last-updated *watching-urls*)
     (let*-values (((url last-updated) (car+cdr url+last-updated))
-                  ((items url-type status) (nijiura-get/cache url)))
+                  ((items url-type status) (nijiura-get-updated url)))
       (dolist (item (or items '()))
+          (log-info item)
         (when (or (not (eq? url-type 'thread)) (date<? last-updated (assoc-ref item 'date)))
           (irc-notice-to (url->channel url) "-" " ")
           (apply
@@ -106,7 +126,7 @@
     (set-cdr! url+last-updated (current-date))))
 
 (define-asynchronous-proc (show-backlog url)
-  (receive (items url-type status) (nijiura-get/cache url)
+  (receive (items url-type status) (nijiura-get-updated url)
     (dolist (item (or items '()))
       (irc-notice-to (url->channel url) "-" " ")
       (apply
@@ -147,7 +167,14 @@
             )))
       (hash-table-get *cache* (channel->url channel) '()))))
 
+(define (command-url channel)
+  (irc-privmsg-to
+    channel
+    "url"
+    (channel->url channel)))
+
 (hash-table-put! *commands* 'grep command-grep)
+(hash-table-put! *commands* 'url  command-url)
 
 ;;; URL <-> Channel
 (define (url->channel url)
@@ -191,28 +218,20 @@
         (stop-watching (channel->url channel)))
       (string-split channel ",")))
 
-  (irc-on-command PRIVMSG (client channel msg)
-    (cond
-      ((string=? msg "url")
-       (irc-notice-to
-         channel
-         #f
-         (channel->url channel)))))
-
   (irc-on-command REFRESH ()
     (refresh))
 
   (irc-on-command EVAL (client . params)
-    (let1 result (guard (e (else e))
+    (let1 result (guard (e (else (ref e 'message)))
                    (eval (call-with-input-string (string-join params) read) (current-module)))
       (irc-notice-to client #f (x->string result))))
 
   (irc-on-command PRIVMSG (client channel msg)
-    (and-let* ((m (#/^:(\w+) (.+)/ msg))
+    (and-let* ((m (#/^:(\w+)(?: (.+))?/ msg))
                (command (m 1))
-               (param   (m 2))
+               (params  (string-split (or (m 2) "") #/\s+/))
                (command-handler (hash-table-get *commands* (string->symbol (string-downcase command)) #f)))
-      (command-handler channel param)))
+      (apply* command-handler channel params)))
 
   (fork-do
     (while #t
